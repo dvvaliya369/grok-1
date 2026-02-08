@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import math
 import os
@@ -34,6 +35,9 @@ from model import QuantizedWeight8bit
 
 logger = logging.getLogger(__name__)
 rank_logger = logging.getLogger("rank")
+
+# Cache for compiled regex patterns to improve performance
+_regex_cache = {}
 
 # Needed for loading the checkpoint with pickle.
 sys.modules['__main__'].QuantizedWeight8bit = QuantizedWeight8bit
@@ -104,7 +108,48 @@ def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None):
         else:
             fs.append(pool.submit(np.zeros, t.shape, dtype=t.dtype))
     wait(fs)
-    return [f.result() for f in fs]
+
+    # Collect results with detailed error handling
+    results = []
+    for i, future in enumerate(fs):
+        try:
+            result = future.result()
+            results.append(result)
+        except Exception as e:
+            logger.error(
+                f"Failed to load tensor at index {i}: {type(e).__name__}: {str(e)}",
+                exc_info=True
+            )
+            # Get the corresponding tensor index and shape for better diagnostics
+            if tensor_indices is None:
+                tensor_idx = i
+            else:
+                tensor_idx = list(tensor_indices)[i] if i < len(list(tensor_indices)) else i
+
+            if i < len(shaped_arrays):
+                shape_info = shaped_arrays[i]
+                logger.error(
+                    f"Tensor details - Index: {tensor_idx}, Shape: {shape_info.shape if hasattr(shape_info, 'shape') else 'N/A'}, "
+                    f"Dtype: {shape_info.dtype if hasattr(shape_info, 'dtype') else 'N/A'}"
+                )
+
+            # Determine if this was a file load or zeros creation
+            if (tensor_idx % num_replicas) == ((jax.process_index() // data_model_shards) % num_replicas):
+                idx = (
+                    jax.process_index() // (num_replicas * data_model_shards) * data_model_shards
+                    + jax.process_index() % data_model_shards
+                )
+                file_path = os.path.join(directory, f"tensor{tensor_idx:05d}_{idx:03d}")
+                logger.error(f"Failed to load from file: {file_path}")
+            else:
+                logger.error(f"Failed to create zero tensor for index {tensor_idx}")
+
+            raise RuntimeError(
+                f"Parallel tensor loading failed at index {i} (tensor {tensor_idx}). "
+                f"Original error: {type(e).__name__}: {str(e)}"
+            ) from e
+
+    return results
 
 
 def path_tuple_to_string(path: tuple) -> str:
@@ -119,6 +164,13 @@ def path_tuple_to_string(path: tuple) -> str:
     return "/".join(pieces)
 
 
+def _get_compiled_pattern(pattern: str) -> re.Pattern:
+    """Get a compiled regex pattern from cache or compile and cache it."""
+    if pattern not in _regex_cache:
+        _regex_cache[pattern] = re.compile(pattern)
+    return _regex_cache[pattern]
+
+
 def get_load_path_str(
     init_path_str: str,
     load_rename_rules: Optional[list[tuple[str, str]]] = None,
@@ -127,15 +179,17 @@ def get_load_path_str(
     # Exclusion
     if load_exclude_rules is not None:
         for search_pattern in load_exclude_rules:
-            if re.search(search_pattern, init_path_str):
+            compiled_pattern = _get_compiled_pattern(search_pattern)
+            if compiled_pattern.search(init_path_str):
                 return None
 
     # Renaming
     load_path_str = init_path_str
     if load_rename_rules is not None:
         for search_pattern, replacement_pattern in load_rename_rules:
-            if re.search(search_pattern, load_path_str):
-                load_path_str = re.sub(search_pattern, replacement_pattern, load_path_str)
+            compiled_pattern = _get_compiled_pattern(search_pattern)
+            if compiled_pattern.search(load_path_str):
+                load_path_str = compiled_pattern.sub(replacement_pattern, load_path_str)
                 break
 
     return load_path_str
