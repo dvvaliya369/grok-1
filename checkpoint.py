@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import math
 import os
@@ -23,7 +24,7 @@ import re
 import shutil
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, wait, as_completed
 from typing import Any, Optional
 
 import jax
@@ -80,10 +81,37 @@ def fast_pickle(obj: Any, path: str) -> None:
             pickle.dump(obj, f)
 
 
+@functools.lru_cache(maxsize=128)
+def _compile_regex(pattern: str) -> re.Pattern:
+    """Cache compiled regex patterns to reduce computational overhead.
+    
+    Args:
+        pattern: The regex pattern string to compile.
+        
+    Returns:
+        Compiled regex pattern object.
+    """
+    return re.compile(pattern)
+
+
 def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None):
-    """Loads a set of arrays."""
+    """Loads a set of arrays with improved error handling for parallel loading.
+    
+    Args:
+        shaped_arrays: Array shapes to load.
+        directory: Directory containing tensor files.
+        mesh_config: Mesh configuration for distributed loading.
+        tensor_indices: Optional specific indices to load.
+        
+    Returns:
+        List of loaded tensors.
+        
+    Raises:
+        RuntimeError: If any tensor fails to load, with detailed error information.
+    """
     pool = ThreadPoolExecutor(max_workers=32)
     fs = list()
+    future_metadata = list()  # Track metadata for better error reporting
     num_tensors = 0
     num_replicas = 1
     data_model_shards = math.prod(mesh_config)
@@ -91,20 +119,88 @@ def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None):
         iterator = enumerate(shaped_arrays)
     else:
         iterator = zip(tensor_indices, shaped_arrays)
+    
     for i, t in iterator:
         if (i % num_replicas) == ((jax.process_index() // data_model_shards) % num_replicas):
             idx = (
                 jax.process_index() // (num_replicas * data_model_shards) * data_model_shards
                 + jax.process_index() % data_model_shards
             )
-            fs.append(
-                pool.submit(fast_unpickle, os.path.join(directory, f"tensor{i:05d}_{idx:03d}"))
-            )
+            tensor_path = os.path.join(directory, f"tensor{i:05d}_{idx:03d}")
+            future = pool.submit(fast_unpickle, tensor_path)
+            fs.append(future)
+            future_metadata.append({
+                'tensor_index': i,
+                'path': tensor_path,
+                'shape': t.shape,
+                'dtype': t.dtype,
+                'is_loaded': True
+            })
             num_tensors += 1
         else:
-            fs.append(pool.submit(np.zeros, t.shape, dtype=t.dtype))
+            future = pool.submit(np.zeros, t.shape, dtype=t.dtype)
+            fs.append(future)
+            future_metadata.append({
+                'tensor_index': i,
+                'path': None,
+                'shape': t.shape,
+                'dtype': t.dtype,
+                'is_loaded': False
+            })
+    
     wait(fs)
-    return [f.result() for f in fs]
+    
+    # Collect results with detailed error handling
+    results = []
+    failed_loads = []
+    
+    for future, metadata in zip(fs, future_metadata):
+        try:
+            result = future.result()
+            results.append(result)
+            if metadata['is_loaded']:
+                logger.debug(
+                    f"Successfully loaded tensor {metadata['tensor_index']} "
+                    f"from {metadata['path']} with shape {metadata['shape']}"
+                )
+        except Exception as e:
+            error_info = {
+                'tensor_index': metadata['tensor_index'],
+                'path': metadata['path'],
+                'shape': metadata['shape'],
+                'dtype': metadata['dtype'],
+                'error': str(e),
+                'error_type': type(e).__name__
+            }
+            failed_loads.append(error_info)
+            
+            logger.error(
+                f"Failed to load tensor {metadata['tensor_index']} "
+                f"from {metadata['path']}: {type(e).__name__}: {e}"
+            )
+            
+            # Re-raise with context for the first failure
+            if len(failed_loads) == 1:
+                logger.error(
+                    f"Tensor details - Shape: {metadata['shape']}, "
+                    f"Dtype: {metadata['dtype']}, Process index: {jax.process_index()}"
+                )
+    
+    # If there were failures, raise a comprehensive error
+    if failed_loads:
+        error_summary = "\n".join([
+            f"  - Tensor {info['tensor_index']} at {info['path']}: "
+            f"{info['error_type']}: {info['error']}"
+            for info in failed_loads
+        ])
+        raise RuntimeError(
+            f"Failed to load {len(failed_loads)} tensor(s) during parallel loading:\n"
+            f"{error_summary}\n"
+            f"Total tensors attempted: {len(fs)}, Successfully loaded: {len(results)}"
+        )
+    
+    logger.info(f"Successfully loaded {num_tensors} tensors from {directory}")
+    return results
 
 
 def path_tuple_to_string(path: tuple) -> str:
@@ -124,18 +220,33 @@ def get_load_path_str(
     load_rename_rules: Optional[list[tuple[str, str]]] = None,
     load_exclude_rules: Optional[list[str]] = None,
 ) -> Optional[str]:
-    # Exclusion
+    """Get the load path string with regex pattern caching for improved performance.
+    
+    Uses cached compiled regex patterns to reduce computational overhead during
+    repeated pattern matching operations.
+    
+    Args:
+        init_path_str: Initial path string to process.
+        load_rename_rules: Optional list of (pattern, replacement) tuples for renaming.
+        load_exclude_rules: Optional list of patterns to exclude.
+        
+    Returns:
+        The processed path string, or None if excluded.
+    """
+    # Exclusion with cached regex patterns
     if load_exclude_rules is not None:
         for search_pattern in load_exclude_rules:
-            if re.search(search_pattern, init_path_str):
+            compiled_pattern = _compile_regex(search_pattern)
+            if compiled_pattern.search(init_path_str):
                 return None
 
-    # Renaming
+    # Renaming with cached regex patterns
     load_path_str = init_path_str
     if load_rename_rules is not None:
         for search_pattern, replacement_pattern in load_rename_rules:
-            if re.search(search_pattern, load_path_str):
-                load_path_str = re.sub(search_pattern, replacement_pattern, load_path_str)
+            compiled_pattern = _compile_regex(search_pattern)
+            if compiled_pattern.search(load_path_str):
+                load_path_str = compiled_pattern.sub(replacement_pattern, load_path_str)
                 break
 
     return load_path_str
