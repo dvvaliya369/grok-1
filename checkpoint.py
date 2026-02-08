@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import math
 import os
@@ -23,6 +24,7 @@ import re
 import shutil
 import sys
 import tempfile
+import traceback
 from concurrent.futures import ThreadPoolExecutor, wait
 from typing import Any, Optional
 
@@ -37,6 +39,12 @@ rank_logger = logging.getLogger("rank")
 
 # Needed for loading the checkpoint with pickle.
 sys.modules['__main__'].QuantizedWeight8bit = QuantizedWeight8bit
+
+
+@functools.lru_cache(maxsize=256)
+def _compile_regex(pattern: str) -> re.Pattern:
+    """Compile and cache a regex pattern to avoid redundant recompilation."""
+    return re.compile(pattern)
 
 
 @contextlib.contextmanager
@@ -82,8 +90,8 @@ def fast_pickle(obj: Any, path: str) -> None:
 
 def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None):
     """Loads a set of arrays."""
-    pool = ThreadPoolExecutor(max_workers=32)
     fs = list()
+    future_metadata = list()
     num_tensors = 0
     num_replicas = 1
     data_model_shards = math.prod(mesh_config)
@@ -91,20 +99,63 @@ def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None):
         iterator = enumerate(shaped_arrays)
     else:
         iterator = zip(tensor_indices, shaped_arrays)
-    for i, t in iterator:
-        if (i % num_replicas) == ((jax.process_index() // data_model_shards) % num_replicas):
-            idx = (
-                jax.process_index() // (num_replicas * data_model_shards) * data_model_shards
-                + jax.process_index() % data_model_shards
+
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        for i, t in iterator:
+            if (i % num_replicas) == (
+                (jax.process_index() // data_model_shards) % num_replicas
+            ):
+                idx = (
+                    jax.process_index() // (num_replicas * data_model_shards) * data_model_shards
+                    + jax.process_index() % data_model_shards
+                )
+                tensor_path = os.path.join(directory, f"tensor{i:05d}_{idx:03d}")
+                fs.append(pool.submit(fast_unpickle, tensor_path))
+                future_metadata.append(
+                    {"tensor_index": i, "path": tensor_path, "task": "unpickle"}
+                )
+                num_tensors += 1
+            else:
+                fs.append(pool.submit(np.zeros, t.shape, dtype=t.dtype))
+                future_metadata.append(
+                    {"tensor_index": i, "path": None, "task": "zeros"}
+                )
+        wait(fs)
+
+    results = []
+    errors = []
+    for future, meta in zip(fs, future_metadata):
+        try:
+            results.append(future.result())
+        except Exception as e:
+            tb = traceback.format_exception(type(e), e, e.__traceback__)
+            logger.error(
+                "Failed to load tensor %d (task=%s, path=%s): %s: %s\n%s",
+                meta["tensor_index"],
+                meta["task"],
+                meta["path"],
+                type(e).__name__,
+                e,
+                "".join(tb),
             )
-            fs.append(
-                pool.submit(fast_unpickle, os.path.join(directory, f"tensor{i:05d}_{idx:03d}"))
-            )
-            num_tensors += 1
-        else:
-            fs.append(pool.submit(np.zeros, t.shape, dtype=t.dtype))
-    wait(fs)
-    return [f.result() for f in fs]
+            errors.append((meta, e))
+            results.append(None)
+
+    if errors:
+        failed_indices = [m["tensor_index"] for m, _ in errors]
+        raise RuntimeError(
+            f"Failed to load {len(errors)}/{len(fs)} tensors. "
+            f"Failed tensor indices: {failed_indices}. "
+            "See error logs above for detailed tracebacks."
+        )
+
+    logger.info(
+        "Successfully loaded %d tensors (%d from checkpoint, %d zero-initialized).",
+        len(results),
+        num_tensors,
+        len(results) - num_tensors,
+    )
+    return results
 
 
 def path_tuple_to_string(path: tuple) -> str:
@@ -127,15 +178,16 @@ def get_load_path_str(
     # Exclusion
     if load_exclude_rules is not None:
         for search_pattern in load_exclude_rules:
-            if re.search(search_pattern, init_path_str):
+            if _compile_regex(search_pattern).search(init_path_str):
                 return None
 
     # Renaming
     load_path_str = init_path_str
     if load_rename_rules is not None:
         for search_pattern, replacement_pattern in load_rename_rules:
-            if re.search(search_pattern, load_path_str):
-                load_path_str = re.sub(search_pattern, replacement_pattern, load_path_str)
+            compiled = _compile_regex(search_pattern)
+            if compiled.search(load_path_str):
+                load_path_str = compiled.sub(replacement_pattern, load_path_str)
                 break
 
     return load_path_str
