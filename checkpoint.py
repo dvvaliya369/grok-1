@@ -286,6 +286,7 @@ def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None,
 
     # Collect results with detailed error handling
     results = []
+    corrupted_files = []
     for f in fs:
         try:
             # Use a short timeout for result retrieval since tasks should be done
@@ -313,22 +314,59 @@ def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None,
             operation = metadata.get('operation', 'unknown')
 
             if operation == 'load_tensor':
+                # For corrupted tensor files, log a warning and create a zero tensor as fallback
+                tensor_index = metadata.get('tensor_index', 'unknown')
+                tensor_path = metadata.get('path', 'unknown')
+                idx = metadata.get('idx', 'unknown')
+
                 error_msg = (
-                    f"Failed to load tensor at index {metadata.get('tensor_index', 'unknown')}: "
-                    f"path='{metadata.get('path', 'unknown')}', idx={metadata.get('idx', 'unknown')}"
+                    f"Corrupted tensor file at index {tensor_index}: "
+                    f"path='{tensor_path}', idx={idx}. "
+                    f"Error: {type(e).__name__}: {str(e)}"
                 )
+                logger.warning(f"{error_msg}. Skipping and using zero tensor as fallback.")
+                rank_logger.warning(f"Skipped corrupted tensor: {tensor_path}")
+
+                corrupted_files.append({
+                    'index': tensor_index,
+                    'path': tensor_path,
+                    'error': str(e)
+                })
+
+                # Get the corresponding shaped array to create a zero tensor
+                if tensor_indices is None:
+                    shaped_array = shaped_arrays[tensor_index]
+                else:
+                    # Find the shaped array by matching the tensor index
+                    shaped_array_idx = list(tensor_indices).index(tensor_index) if tensor_index in tensor_indices else None
+                    if shaped_array_idx is not None:
+                        shaped_array = shaped_arrays[shaped_array_idx]
+                    else:
+                        # Fallback: use a small default tensor if shape cannot be determined
+                        logger.error(f"Cannot determine shape for corrupted tensor {tensor_index}, using default 1x1 array")
+                        shaped_array = type('ShapedArray', (), {'shape': (1,), 'dtype': np.float32})()
+
+                # Create zero tensor with the expected shape and dtype
+                results.append(np.zeros(shaped_array.shape, dtype=shaped_array.dtype))
             else:
                 error_msg = (
                     f"Failed to create zeros tensor at index {metadata.get('tensor_index', 'unknown')}: "
                     f"shape={metadata.get('shape', 'unknown')}, dtype={metadata.get('dtype', 'unknown')}"
                 )
 
-            logger.error(f"{error_msg}. Error: {type(e).__name__}: {str(e)}")
-            pool.shutdown(wait=False)
-            raise RuntimeError(error_msg) from e
+                logger.error(f"{error_msg}. Error: {type(e).__name__}: {str(e)}")
+                pool.shutdown(wait=False)
+                raise RuntimeError(error_msg) from e
 
     pool.shutdown(wait=True)
-    rank_logger.info(f"Successfully loaded {len(results)} tensors")
+
+    # Report summary of loaded and skipped tensors
+    if corrupted_files:
+        rank_logger.warning(f"Loaded {len(results)} tensors with {len(corrupted_files)} corrupted file(s) skipped:")
+        for corrupted in corrupted_files:
+            rank_logger.warning(f"  - Index {corrupted['index']}: {corrupted['path']} ({corrupted['error']})")
+    else:
+        rank_logger.info(f"Successfully loaded {len(results)} tensors")
 
     # Log metrics summary for this load operation
     _metrics.log_summary()
