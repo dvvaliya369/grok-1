@@ -41,6 +41,52 @@ rank_logger = logging.getLogger("rank")
 sys.modules['__main__'].QuantizedWeight8bit = QuantizedWeight8bit
 
 
+# Configuration for ThreadPoolExecutor resource management
+DEFAULT_MAX_WORKERS = 32
+DEFAULT_LOAD_TIMEOUT = None  # No timeout by default (in seconds)
+
+
+def _get_max_workers(max_workers: Optional[int] = None) -> int:
+    """Get the maximum number of worker threads for parallel tensor loading.
+    
+    Priority: explicit parameter > environment variable > default constant.
+    """
+    if max_workers is not None:
+        return max_workers
+    env_workers = os.environ.get("CHECKPOINT_MAX_WORKERS")
+    if env_workers:
+        try:
+            return int(env_workers)
+        except ValueError:
+            logger.warning(
+                "Invalid CHECKPOINT_MAX_WORKERS='%s', using default %d",
+                env_workers,
+                DEFAULT_MAX_WORKERS,
+            )
+    return DEFAULT_MAX_WORKERS
+
+
+def _get_timeout(timeout: Optional[float] = None) -> Optional[float]:
+    """Get the timeout for individual tensor loading operations.
+    
+    Priority: explicit parameter > environment variable > default constant.
+    Returns None for no timeout.
+    """
+    if timeout is not None:
+        return timeout
+    env_timeout = os.environ.get("CHECKPOINT_LOAD_TIMEOUT")
+    if env_timeout:
+        try:
+            return float(env_timeout)
+        except ValueError:
+            logger.warning(
+                "Invalid CHECKPOINT_LOAD_TIMEOUT='%s', using default %s",
+                env_timeout,
+                DEFAULT_LOAD_TIMEOUT,
+            )
+    return DEFAULT_LOAD_TIMEOUT
+
+
 @contextlib.contextmanager
 def copy_to_shm(file: str):
     if file.startswith("/dev/shm/"):
@@ -82,8 +128,41 @@ def fast_pickle(obj: Any, path: str) -> None:
             pickle.dump(obj, f)
 
 
-def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None):
-    """Loads a set of arrays."""
+def load_tensors(
+    shaped_arrays,
+    directory,
+    mesh_config,
+    tensor_indices=None,
+    max_workers: Optional[int] = None,
+    timeout: Optional[float] = None,
+):
+    """Loads a set of arrays with configurable parallelism and timeout.
+    
+    Args:
+        shaped_arrays: Array shapes to load.
+        directory: Directory containing tensor files.
+        mesh_config: Mesh configuration for sharding.
+        tensor_indices: Optional tensor indices to load.
+        max_workers: Maximum number of worker threads. If None, uses
+            CHECKPOINT_MAX_WORKERS env var or DEFAULT_MAX_WORKERS.
+        timeout: Timeout in seconds for each tensor load. If None, uses
+            CHECKPOINT_LOAD_TIMEOUT env var or no timeout.
+    
+    Returns:
+        List of loaded tensors.
+    
+    Raises:
+        RuntimeError: If any tensor fails to load.
+    """
+    actual_max_workers = _get_max_workers(max_workers)
+    actual_timeout = _get_timeout(timeout)
+    
+    logger.info(
+        "Loading tensors with max_workers=%d, timeout=%s",
+        actual_max_workers,
+        actual_timeout if actual_timeout is not None else "None",
+    )
+    
     fs = []
     tensor_metadata = []
     num_tensors = 0
@@ -94,7 +173,7 @@ def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None):
     else:
         iterator = zip(tensor_indices, shaped_arrays)
 
-    with ThreadPoolExecutor(max_workers=32) as pool:
+    with ThreadPoolExecutor(max_workers=actual_max_workers) as pool:
         for i, t in iterator:
             if (i % num_replicas) == (
                 (jax.process_index() // data_model_shards) % num_replicas
@@ -116,7 +195,25 @@ def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None):
         for future_idx, future in enumerate(fs):
             tensor_idx, file_path = tensor_metadata[future_idx]
             try:
-                results.append(future.result())
+                results.append(future.result(timeout=actual_timeout))
+            except TimeoutError as e:
+                tb = traceback.format_exc()
+                if file_path is not None:
+                    logger.error(
+                        "Timeout loading tensor %d from '%s' after %s seconds\n%s",
+                        tensor_idx,
+                        file_path,
+                        actual_timeout,
+                        tb,
+                    )
+                else:
+                    logger.error(
+                        "Timeout creating zero tensor %d after %s seconds\n%s",
+                        tensor_idx,
+                        actual_timeout,
+                        tb,
+                    )
+                errors.append((tensor_idx, file_path, e))
             except Exception as e:
                 tb = traceback.format_exc()
                 if file_path is not None:
@@ -241,7 +338,25 @@ def restore(
     params_only,
     state_sharding,
     init_state: Optional[Any] = None,
+    max_workers: Optional[int] = None,
+    timeout: Optional[float] = None,
 ) -> Any:
+    """Restore model state from checkpoint with configurable resource limits.
+    
+    Args:
+        checkpoint_path: Path to checkpoint directory.
+        state_shapes: Expected state shapes.
+        mesh: JAX mesh for distributed computation.
+        between_hosts_config: Configuration for multi-host setup.
+        params_only: Whether to return only parameters.
+        state_sharding: Sharding specification for state.
+        init_state: Optional initial state for validation.
+        max_workers: Maximum worker threads for parallel loading.
+        timeout: Timeout in seconds for each tensor load operation.
+    
+    Returns:
+        Restored model state.
+    """
     ckpt_path = os.path.join(checkpoint_path, "ckpt-0")
 
     rank_logger.info("Loading checkpoint at {}".format(ckpt_path))
@@ -249,7 +364,13 @@ def restore(
     ckpt_shapes_with_path, structure = jax.tree_util.tree_flatten_with_path(ckpt_shapes)
 
     ckpt_shapes_flat = [elem[1] for elem in ckpt_shapes_with_path]
-    loaded_tensors = load_tensors(ckpt_shapes_flat, ckpt_path, between_hosts_config)
+    loaded_tensors = load_tensors(
+        ckpt_shapes_flat,
+        ckpt_path,
+        between_hosts_config,
+        max_workers=max_workers,
+        timeout=timeout,
+    )
 
     state = jax.tree_util.tree_unflatten(structure, loaded_tensors)
 
