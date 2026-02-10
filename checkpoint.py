@@ -24,6 +24,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
@@ -39,6 +40,56 @@ rank_logger = logging.getLogger("rank")
 
 # Needed for loading the checkpoint with pickle.
 sys.modules['__main__'].QuantizedWeight8bit = QuantizedWeight8bit
+
+
+class RegexCacheMetrics:
+    """Tracks regex cache hit/miss statistics for performance monitoring."""
+    
+    def __init__(self):
+        self.total_calls = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+    
+    def record_call(self, is_hit: bool):
+        """Record a cache access (hit or miss)."""
+        self.total_calls += 1
+        if is_hit:
+            self.cache_hits += 1
+        else:
+            self.cache_misses += 1
+    
+    def get_stats(self) -> dict:
+        """Get current cache statistics."""
+        hit_rate = (self.cache_hits / self.total_calls * 100) if self.total_calls > 0 else 0.0
+        return {
+            'total_calls': self.total_calls,
+            'cache_hits': self.cache_hits,
+            'cache_misses': self.cache_misses,
+            'hit_rate_percent': hit_rate,
+        }
+    
+    def reset(self):
+        """Reset all counters to zero."""
+        self.total_calls = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+    
+    def log_stats(self, logger_instance=None, prefix="Regex cache"):
+        """Log cache statistics."""
+        stats = self.get_stats()
+        log = logger_instance or logger
+        log.info(
+            "%s stats: %d total calls, %d hits, %d misses, %.1f%% hit rate",
+            prefix,
+            stats['total_calls'],
+            stats['cache_hits'],
+            stats['cache_misses'],
+            stats['hit_rate_percent'],
+        )
+
+
+# Global instance for tracking regex cache metrics
+_regex_metrics = RegexCacheMetrics()
 
 
 # Configuration for ThreadPoolExecutor resource management
@@ -157,6 +208,8 @@ def load_tensors(
     actual_max_workers = _get_max_workers(max_workers)
     actual_timeout = _get_timeout(timeout)
     
+    load_start_time = time.time()
+    
     logger.info(
         "Loading tensors with max_workers=%d, timeout=%s",
         actual_max_workers,
@@ -165,6 +218,7 @@ def load_tensors(
     
     fs = []
     tensor_metadata = []
+    tensor_times = []
     num_tensors = 0
     num_replicas = 1
     data_model_shards = math.prod(mesh_config)
@@ -194,8 +248,11 @@ def load_tensors(
         errors = []
         for future_idx, future in enumerate(fs):
             tensor_idx, file_path = tensor_metadata[future_idx]
+            tensor_start = time.time()
             try:
                 results.append(future.result(timeout=actual_timeout))
+                tensor_elapsed = time.time() - tensor_start
+                tensor_times.append(tensor_elapsed)
             except TimeoutError as e:
                 tb = traceback.format_exc()
                 if file_path is not None:
@@ -249,6 +306,28 @@ def load_tensors(
                 f"First failure: tensor {errors[0][0]} "
                 f"from '{errors[0][1]}': {errors[0][2]}"
             )
+    
+    # Log timing metrics
+    total_load_time = time.time() - load_start_time
+    if tensor_times:
+        avg_time = sum(tensor_times) / len(tensor_times)
+        min_time = min(tensor_times)
+        max_time = max(tensor_times)
+        logger.info(
+            "Tensor loading metrics: %d tensors loaded in %.2fs "
+            "(avg: %.3fs/tensor, min: %.3fs, max: %.3fs)",
+            len(results),
+            total_load_time,
+            avg_time,
+            min_time,
+            max_time,
+        )
+    else:
+        logger.info(
+            "Tensor loading metrics: %d tensors loaded in %.2fs",
+            len(results),
+            total_load_time,
+        )
 
     return results
 
@@ -271,6 +350,19 @@ def _compile_regex(pattern: str) -> re.Pattern:
     return re.compile(pattern)
 
 
+def _compile_regex_with_metrics(pattern: str) -> re.Pattern:
+    """Compile regex with cache hit/miss tracking for performance monitoring."""
+    cache_info_before = _compile_regex.cache_info()
+    result = _compile_regex(pattern)
+    cache_info_after = _compile_regex.cache_info()
+    
+    # A cache hit occurred if the hit count increased
+    is_hit = cache_info_after.hits > cache_info_before.hits
+    _regex_metrics.record_call(is_hit)
+    
+    return result
+
+
 def get_load_path_str(
     init_path_str: str,
     load_rename_rules: Optional[list[tuple[str, str]]] = None,
@@ -279,14 +371,14 @@ def get_load_path_str(
     # Exclusion
     if load_exclude_rules is not None:
         for search_pattern in load_exclude_rules:
-            if _compile_regex(search_pattern).search(init_path_str):
+            if _compile_regex_with_metrics(search_pattern).search(init_path_str):
                 return None
 
     # Renaming
     load_path_str = init_path_str
     if load_rename_rules is not None:
         for search_pattern, replacement_pattern in load_rename_rules:
-            compiled = _compile_regex(search_pattern)
+            compiled = _compile_regex_with_metrics(search_pattern)
             if compiled.search(load_path_str):
                 load_path_str = compiled.sub(replacement_pattern, load_path_str)
                 break
@@ -301,6 +393,9 @@ def replace_with_load_state(
     load_exclude_rules: Optional[list[str]] = None,
     mesh_config: tuple = (1, 1),
 ) -> Any:
+    # Reset regex cache metrics before processing
+    _regex_metrics.reset()
+    
     flatten_load, _ = jax.tree_util.tree_flatten_with_path(load_state)
     flatten_init, structure_init = jax.tree_util.tree_flatten_with_path(init_state)
     load_map = {path_tuple_to_string(path): tensor for path, tensor in flatten_load}
@@ -308,9 +403,13 @@ def replace_with_load_state(
     replaced = []
     num_replicas = 1
     data_model_shards = math.prod(mesh_config)
+    num_paths_processed = 0
+    
     for i, (init_path, tensor) in enumerate(flatten_init):
         init_path_str = path_tuple_to_string(init_path)
         load_path_str = get_load_path_str(init_path_str, load_rename_rules, load_exclude_rules)
+        num_paths_processed += 1
+        
         if load_path_str is None:
             rank_logger.info(f"Excluded from restore: {init_path_str}.")
             replaced.append(tensor)
@@ -326,6 +425,12 @@ def replace_with_load_state(
                 replaced.append(tensor)
             else:
                 replaced.append(np.zeros_like(tensor))
+    
+    # Log regex cache metrics after processing all paths
+    _regex_metrics.log_stats(
+        logger_instance=rank_logger,
+        prefix=f"Regex cache (processed {num_paths_processed} paths)",
+    )
 
     return jax.tree_util.tree_unflatten(structure_init, replaced)
 
