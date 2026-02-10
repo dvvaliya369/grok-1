@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import math
 import os
@@ -23,7 +24,8 @@ import re
 import shutil
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, wait
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 import jax
@@ -82,8 +84,8 @@ def fast_pickle(obj: Any, path: str) -> None:
 
 def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None):
     """Loads a set of arrays."""
-    pool = ThreadPoolExecutor(max_workers=32)
-    fs = list()
+    fs = []
+    tensor_metadata = []
     num_tensors = 0
     num_replicas = 1
     data_model_shards = math.prod(mesh_config)
@@ -91,20 +93,67 @@ def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None):
         iterator = enumerate(shaped_arrays)
     else:
         iterator = zip(tensor_indices, shaped_arrays)
-    for i, t in iterator:
-        if (i % num_replicas) == ((jax.process_index() // data_model_shards) % num_replicas):
-            idx = (
-                jax.process_index() // (num_replicas * data_model_shards) * data_model_shards
-                + jax.process_index() % data_model_shards
+
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        for i, t in iterator:
+            if (i % num_replicas) == (
+                (jax.process_index() // data_model_shards) % num_replicas
+            ):
+                idx = (
+                    jax.process_index() // (num_replicas * data_model_shards) * data_model_shards
+                    + jax.process_index() % data_model_shards
+                )
+                file_path = os.path.join(directory, f"tensor{i:05d}_{idx:03d}")
+                fs.append(pool.submit(fast_unpickle, file_path))
+                tensor_metadata.append((i, file_path))
+                num_tensors += 1
+            else:
+                fs.append(pool.submit(np.zeros, t.shape, dtype=t.dtype))
+                tensor_metadata.append((i, None))
+
+        results = []
+        errors = []
+        for future_idx, future in enumerate(fs):
+            tensor_idx, file_path = tensor_metadata[future_idx]
+            try:
+                results.append(future.result())
+            except Exception as e:
+                tb = traceback.format_exc()
+                if file_path is not None:
+                    logger.error(
+                        "Failed to load tensor %d from '%s': %s: %s\n%s",
+                        tensor_idx,
+                        file_path,
+                        type(e).__name__,
+                        e,
+                        tb,
+                    )
+                else:
+                    logger.error(
+                        "Failed to create zero tensor %d: %s: %s\n%s",
+                        tensor_idx,
+                        type(e).__name__,
+                        e,
+                        tb,
+                    )
+                errors.append((tensor_idx, file_path, e))
+
+        if errors:
+            failed_indices = [idx for idx, _, _ in errors]
+            logger.error(
+                "Tensor loading failed for %d out of %d tensors. "
+                "Failed tensor indices: %s",
+                len(errors),
+                len(fs),
+                failed_indices,
             )
-            fs.append(
-                pool.submit(fast_unpickle, os.path.join(directory, f"tensor{i:05d}_{idx:03d}"))
+            raise RuntimeError(
+                f"Failed to load {len(errors)} tensor(s). "
+                f"First failure: tensor {errors[0][0]} "
+                f"from '{errors[0][1]}': {errors[0][2]}"
             )
-            num_tensors += 1
-        else:
-            fs.append(pool.submit(np.zeros, t.shape, dtype=t.dtype))
-    wait(fs)
-    return [f.result() for f in fs]
+
+    return results
 
 
 def path_tuple_to_string(path: tuple) -> str:
@@ -119,6 +168,12 @@ def path_tuple_to_string(path: tuple) -> str:
     return "/".join(pieces)
 
 
+@functools.lru_cache(maxsize=256)
+def _compile_regex(pattern: str) -> re.Pattern:
+    """Compile and cache a regex pattern to avoid redundant recompilation."""
+    return re.compile(pattern)
+
+
 def get_load_path_str(
     init_path_str: str,
     load_rename_rules: Optional[list[tuple[str, str]]] = None,
@@ -127,15 +182,16 @@ def get_load_path_str(
     # Exclusion
     if load_exclude_rules is not None:
         for search_pattern in load_exclude_rules:
-            if re.search(search_pattern, init_path_str):
+            if _compile_regex(search_pattern).search(init_path_str):
                 return None
 
     # Renaming
     load_path_str = init_path_str
     if load_rename_rules is not None:
         for search_pattern, replacement_pattern in load_rename_rules:
-            if re.search(search_pattern, load_path_str):
-                load_path_str = re.sub(search_pattern, replacement_pattern, load_path_str)
+            compiled = _compile_regex(search_pattern)
+            if compiled.search(load_path_str):
+                load_path_str = compiled.sub(replacement_pattern, load_path_str)
                 break
 
     return load_path_str
