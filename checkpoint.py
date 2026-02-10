@@ -23,6 +23,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, wait, TimeoutError as FuturesTimeoutError
 from typing import Any, Optional
 
@@ -34,6 +35,96 @@ from model import QuantizedWeight8bit
 
 logger = logging.getLogger(__name__)
 rank_logger = logging.getLogger("rank")
+
+# Metrics tracking
+class MetricsCollector:
+    """Collects performance metrics for tensor loading and regex caching."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Reset all metrics."""
+        self.tensor_load_times = []
+        self.total_tensors_loaded = 0
+        self.regex_cache_hits = 0
+        self.regex_cache_misses = 0
+        self.regex_patterns_cached = 0
+
+    def record_tensor_load(self, load_time: float):
+        """Record time taken to load a tensor."""
+        self.tensor_load_times.append(load_time)
+        self.total_tensors_loaded += 1
+
+    def record_cache_hit(self):
+        """Record a regex cache hit."""
+        self.regex_cache_hits += 1
+
+    def record_cache_miss(self, pattern: str):
+        """Record a regex cache miss and new pattern addition."""
+        self.regex_cache_misses += 1
+        self.regex_patterns_cached += 1
+
+    def get_cache_hit_rate(self) -> float:
+        """Calculate cache hit rate as a percentage."""
+        total_lookups = self.regex_cache_hits + self.regex_cache_misses
+        if total_lookups == 0:
+            return 0.0
+        return (self.regex_cache_hits / total_lookups) * 100.0
+
+    def get_average_load_time(self) -> float:
+        """Calculate average tensor load time in seconds."""
+        if not self.tensor_load_times:
+            return 0.0
+        return sum(self.tensor_load_times) / len(self.tensor_load_times)
+
+    def get_total_load_time(self) -> float:
+        """Calculate total tensor load time in seconds."""
+        return sum(self.tensor_load_times)
+
+    def get_min_load_time(self) -> float:
+        """Get minimum tensor load time."""
+        return min(self.tensor_load_times) if self.tensor_load_times else 0.0
+
+    def get_max_load_time(self) -> float:
+        """Get maximum tensor load time."""
+        return max(self.tensor_load_times) if self.tensor_load_times else 0.0
+
+    def log_summary(self):
+        """Log a summary of collected metrics."""
+        if self.total_tensors_loaded > 0:
+            rank_logger.info("=" * 80)
+            rank_logger.info("TENSOR LOADING METRICS")
+            rank_logger.info("=" * 80)
+            rank_logger.info(f"Total tensors loaded: {self.total_tensors_loaded}")
+            rank_logger.info(f"Total load time: {self.get_total_load_time():.4f}s")
+            rank_logger.info(f"Average load time: {self.get_average_load_time():.4f}s")
+            rank_logger.info(f"Min load time: {self.get_min_load_time():.4f}s")
+            rank_logger.info(f"Max load time: {self.get_max_load_time():.4f}s")
+            rank_logger.info("=" * 80)
+
+        total_lookups = self.regex_cache_hits + self.regex_cache_misses
+        if total_lookups > 0:
+            rank_logger.info("=" * 80)
+            rank_logger.info("REGEX CACHE METRICS")
+            rank_logger.info("=" * 80)
+            rank_logger.info(f"Total regex lookups: {total_lookups}")
+            rank_logger.info(f"Cache hits: {self.regex_cache_hits}")
+            rank_logger.info(f"Cache misses: {self.regex_cache_misses}")
+            rank_logger.info(f"Cache hit rate: {self.get_cache_hit_rate():.2f}%")
+            rank_logger.info(f"Patterns cached: {self.regex_patterns_cached}")
+            rank_logger.info("=" * 80)
+
+# Global metrics collector instance
+_metrics = MetricsCollector()
+
+def get_metrics():
+    """Return the global metrics collector for external access."""
+    return _metrics
+
+def reset_metrics():
+    """Reset all metrics."""
+    _metrics.reset()
 
 # Configuration for ThreadPoolExecutor
 DEFAULT_MAX_WORKERS = 32
@@ -73,9 +164,13 @@ def copy_from_shm(file: str):
 
 
 def fast_unpickle(path: str) -> Any:
+    start_time = time.time()
     with copy_to_shm(path) as tmp_path:
         with open(tmp_path, "rb") as f:
-            return pickle.load(f)
+            result = pickle.load(f)
+    load_time = time.time() - start_time
+    _metrics.record_tensor_load(load_time)
+    return result
 
 
 def fast_pickle(obj: Any, path: str) -> None:
@@ -99,6 +194,9 @@ def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None,
     Returns:
         List of loaded tensors
     """
+    # Reset metrics at the start of each load operation
+    _metrics.reset()
+
     # Use environment variables or defaults for configuration
     if max_workers is None:
         max_workers = int(os.environ.get('CHECKPOINT_MAX_WORKERS', DEFAULT_MAX_WORKERS))
@@ -231,6 +329,10 @@ def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None,
 
     pool.shutdown(wait=True)
     rank_logger.info(f"Successfully loaded {len(results)} tensors")
+
+    # Log metrics summary for this load operation
+    _metrics.log_summary()
+
     return results
 
 
@@ -252,7 +354,10 @@ _regex_cache = {}
 def _get_compiled_regex(pattern: str):
     """Returns a compiled regex pattern, using cache to avoid recompilation."""
     if pattern not in _regex_cache:
+        _metrics.record_cache_miss(pattern)
         _regex_cache[pattern] = re.compile(pattern)
+    else:
+        _metrics.record_cache_hit()
     return _regex_cache[pattern]
 
 def get_load_path_str(
