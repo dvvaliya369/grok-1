@@ -147,6 +147,10 @@ class ModelRunner:
 
     checkpoint_path: str = ""
 
+    # ThreadPoolExecutor configuration for checkpoint loading
+    max_workers: Optional[int] = None  # Number of worker threads for loading
+    task_timeout: Optional[float] = None  # Timeout for individual loading tasks
+
     def make_forward_fn(self, mesh: Any):
         def forward(tokens):
             out = self.model.make(mesh=mesh)(tokens)
