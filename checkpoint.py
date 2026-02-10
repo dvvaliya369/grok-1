@@ -91,20 +91,63 @@ def load_tensors(shaped_arrays, directory, mesh_config, tensor_indices=None):
         iterator = enumerate(shaped_arrays)
     else:
         iterator = zip(tensor_indices, shaped_arrays)
+
+    # Track futures with metadata for better error reporting
+    future_metadata = {}
+
     for i, t in iterator:
         if (i % num_replicas) == ((jax.process_index() // data_model_shards) % num_replicas):
             idx = (
                 jax.process_index() // (num_replicas * data_model_shards) * data_model_shards
                 + jax.process_index() % data_model_shards
             )
-            fs.append(
-                pool.submit(fast_unpickle, os.path.join(directory, f"tensor{i:05d}_{idx:03d}"))
-            )
+            tensor_path = os.path.join(directory, f"tensor{i:05d}_{idx:03d}")
+            future = pool.submit(fast_unpickle, tensor_path)
+            fs.append(future)
+            future_metadata[future] = {
+                'tensor_index': i,
+                'idx': idx,
+                'path': tensor_path,
+                'operation': 'load_tensor'
+            }
             num_tensors += 1
         else:
-            fs.append(pool.submit(np.zeros, t.shape, dtype=t.dtype))
+            future = pool.submit(np.zeros, t.shape, dtype=t.dtype)
+            fs.append(future)
+            future_metadata[future] = {
+                'tensor_index': i,
+                'shape': t.shape,
+                'dtype': t.dtype,
+                'operation': 'create_zeros'
+            }
+
     wait(fs)
-    return [f.result() for f in fs]
+
+    # Collect results with detailed error handling
+    results = []
+    for f in fs:
+        try:
+            results.append(f.result())
+        except Exception as e:
+            metadata = future_metadata.get(f, {})
+            operation = metadata.get('operation', 'unknown')
+
+            if operation == 'load_tensor':
+                error_msg = (
+                    f"Failed to load tensor at index {metadata.get('tensor_index', 'unknown')}: "
+                    f"path='{metadata.get('path', 'unknown')}', idx={metadata.get('idx', 'unknown')}"
+                )
+            else:
+                error_msg = (
+                    f"Failed to create zeros tensor at index {metadata.get('tensor_index', 'unknown')}: "
+                    f"shape={metadata.get('shape', 'unknown')}, dtype={metadata.get('dtype', 'unknown')}"
+                )
+
+            logger.error(f"{error_msg}. Error: {type(e).__name__}: {str(e)}")
+            raise RuntimeError(error_msg) from e
+
+    pool.shutdown(wait=True)
+    return results
 
 
 def path_tuple_to_string(path: tuple) -> str:
@@ -119,6 +162,15 @@ def path_tuple_to_string(path: tuple) -> str:
     return "/".join(pieces)
 
 
+# Cache for compiled regex patterns to reduce computational overhead
+_regex_cache = {}
+
+def _get_compiled_regex(pattern: str):
+    """Returns a compiled regex pattern, using cache to avoid recompilation."""
+    if pattern not in _regex_cache:
+        _regex_cache[pattern] = re.compile(pattern)
+    return _regex_cache[pattern]
+
 def get_load_path_str(
     init_path_str: str,
     load_rename_rules: Optional[list[tuple[str, str]]] = None,
@@ -127,15 +179,17 @@ def get_load_path_str(
     # Exclusion
     if load_exclude_rules is not None:
         for search_pattern in load_exclude_rules:
-            if re.search(search_pattern, init_path_str):
+            compiled_pattern = _get_compiled_regex(search_pattern)
+            if compiled_pattern.search(init_path_str):
                 return None
 
     # Renaming
     load_path_str = init_path_str
     if load_rename_rules is not None:
         for search_pattern, replacement_pattern in load_rename_rules:
-            if re.search(search_pattern, load_path_str):
-                load_path_str = re.sub(search_pattern, replacement_pattern, load_path_str)
+            compiled_pattern = _get_compiled_regex(search_pattern)
+            if compiled_pattern.search(load_path_str):
+                load_path_str = compiled_pattern.sub(replacement_pattern, load_path_str)
                 break
 
     return load_path_str
