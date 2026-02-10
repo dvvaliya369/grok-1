@@ -146,6 +146,7 @@ class ModelRunner:
     transform_forward: bool = False
 
     checkpoint_path: str = ""
+    skip_corrupted: bool = False  # Whether to skip corrupted tensor files
 
     def make_forward_fn(self, mesh: Any):
         def forward(tokens):
@@ -243,6 +244,7 @@ class ModelRunner:
                 state_sharding=self.state_sharding,
                 init_state=init_state,
                 params_only=True,
+                skip_corrupted=self.skip_corrupted,
             )
 
             del init_state

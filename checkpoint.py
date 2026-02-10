@@ -95,6 +95,7 @@ _regex_metrics = RegexCacheMetrics()
 # Configuration for ThreadPoolExecutor resource management
 DEFAULT_MAX_WORKERS = 32
 DEFAULT_LOAD_TIMEOUT = None  # No timeout by default (in seconds)
+DEFAULT_SKIP_CORRUPTED = False  # Whether to skip corrupted tensors by default
 
 
 def _get_max_workers(max_workers: Optional[int] = None) -> int:
@@ -136,6 +137,20 @@ def _get_timeout(timeout: Optional[float] = None) -> Optional[float]:
                 DEFAULT_LOAD_TIMEOUT,
             )
     return DEFAULT_LOAD_TIMEOUT
+
+
+def _get_skip_corrupted(skip_corrupted: Optional[bool] = None) -> bool:
+    """Get whether to skip corrupted tensor files.
+    
+    Priority: explicit parameter > environment variable > default constant.
+    Returns True to skip corrupted files, False to raise errors.
+    """
+    if skip_corrupted is not None:
+        return skip_corrupted
+    env_skip = os.environ.get("CHECKPOINT_SKIP_CORRUPTED")
+    if env_skip:
+        return env_skip.lower() in ("true", "1", "yes", "on")
+    return DEFAULT_SKIP_CORRUPTED
 
 
 @contextlib.contextmanager
@@ -186,6 +201,7 @@ def load_tensors(
     tensor_indices=None,
     max_workers: Optional[int] = None,
     timeout: Optional[float] = None,
+    skip_corrupted: Optional[bool] = None,
 ):
     """Loads a set of arrays with configurable parallelism and timeout.
     
@@ -198,22 +214,27 @@ def load_tensors(
             CHECKPOINT_MAX_WORKERS env var or DEFAULT_MAX_WORKERS.
         timeout: Timeout in seconds for each tensor load. If None, uses
             CHECKPOINT_LOAD_TIMEOUT env var or no timeout.
+        skip_corrupted: Whether to skip corrupted tensor files and use zero
+            tensors as fallback. If None, uses CHECKPOINT_SKIP_CORRUPTED env
+            var or DEFAULT_SKIP_CORRUPTED.
     
     Returns:
         List of loaded tensors.
     
     Raises:
-        RuntimeError: If any tensor fails to load.
+        RuntimeError: If any tensor fails to load and skip_corrupted is False.
     """
     actual_max_workers = _get_max_workers(max_workers)
     actual_timeout = _get_timeout(timeout)
+    actual_skip_corrupted = _get_skip_corrupted(skip_corrupted)
     
     load_start_time = time.time()
     
     logger.info(
-        "Loading tensors with max_workers=%d, timeout=%s",
+        "Loading tensors with max_workers=%d, timeout=%s, skip_corrupted=%s",
         actual_max_workers,
         actual_timeout if actual_timeout is not None else "None",
+        actual_skip_corrupted,
     )
     
     fs = []
@@ -246,6 +267,8 @@ def load_tensors(
 
         results = []
         errors = []
+        skipped_corrupted = []
+        
         for future_idx, future in enumerate(fs):
             tensor_idx, file_path = tensor_metadata[future_idx]
             tensor_start = time.time()
@@ -270,7 +293,20 @@ def load_tensors(
                         actual_timeout,
                         tb,
                     )
-                errors.append((tensor_idx, file_path, e))
+                
+                if actual_skip_corrupted:
+                    # Use zero tensor as fallback
+                    shape_idx = future_idx if tensor_indices is None else list(tensor_indices).index(tensor_idx)
+                    fallback_tensor = np.zeros(shaped_arrays[shape_idx].shape, dtype=shaped_arrays[shape_idx].dtype)
+                    results.append(fallback_tensor)
+                    skipped_corrupted.append((tensor_idx, file_path, e))
+                    logger.warning(
+                        "Skipped corrupted tensor %d from '%s' (timeout), using zero tensor as fallback",
+                        tensor_idx,
+                        file_path if file_path else "N/A",
+                    )
+                else:
+                    errors.append((tensor_idx, file_path, e))
             except Exception as e:
                 tb = traceback.format_exc()
                 if file_path is not None:
@@ -290,7 +326,22 @@ def load_tensors(
                         e,
                         tb,
                     )
-                errors.append((tensor_idx, file_path, e))
+                
+                if actual_skip_corrupted:
+                    # Use zero tensor as fallback
+                    shape_idx = future_idx if tensor_indices is None else list(tensor_indices).index(tensor_idx)
+                    fallback_tensor = np.zeros(shaped_arrays[shape_idx].shape, dtype=shaped_arrays[shape_idx].dtype)
+                    results.append(fallback_tensor)
+                    skipped_corrupted.append((tensor_idx, file_path, e))
+                    logger.warning(
+                        "Skipped corrupted tensor %d from '%s' (%s: %s), using zero tensor as fallback",
+                        tensor_idx,
+                        file_path if file_path else "N/A",
+                        type(e).__name__,
+                        e,
+                    )
+                else:
+                    errors.append((tensor_idx, file_path, e))
 
         if errors:
             failed_indices = [idx for idx, _, _ in errors]
@@ -305,6 +356,15 @@ def load_tensors(
                 f"Failed to load {len(errors)} tensor(s). "
                 f"First failure: tensor {errors[0][0]} "
                 f"from '{errors[0][1]}': {errors[0][2]}"
+            )
+        
+        if skipped_corrupted:
+            skipped_indices = [idx for idx, _, _ in skipped_corrupted]
+            logger.warning(
+                "Successfully loaded checkpoint with %d corrupted tensor(s) skipped. "
+                "Skipped tensor indices: %s. These tensors were replaced with zero tensors.",
+                len(skipped_corrupted),
+                skipped_indices,
             )
     
     # Log timing metrics
@@ -445,6 +505,7 @@ def restore(
     init_state: Optional[Any] = None,
     max_workers: Optional[int] = None,
     timeout: Optional[float] = None,
+    skip_corrupted: Optional[bool] = None,
 ) -> Any:
     """Restore model state from checkpoint with configurable resource limits.
     
@@ -458,6 +519,8 @@ def restore(
         init_state: Optional initial state for validation.
         max_workers: Maximum worker threads for parallel loading.
         timeout: Timeout in seconds for each tensor load operation.
+        skip_corrupted: Whether to skip corrupted tensor files and use zero
+            tensors as fallback.
     
     Returns:
         Restored model state.
@@ -475,6 +538,7 @@ def restore(
         between_hosts_config,
         max_workers=max_workers,
         timeout=timeout,
+        skip_corrupted=skip_corrupted,
     )
 
     state = jax.tree_util.tree_unflatten(structure, loaded_tensors)
